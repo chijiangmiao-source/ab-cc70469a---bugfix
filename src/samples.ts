@@ -1,4 +1,4 @@
-/** 内置样例场景：覆盖并发新增/撤销收敛、乱序暂存释放、重复投递幂等 */
+/** 内置样例场景：覆盖并发新增/撤销收敛、乱序暂存释放、两级释放链、重复投递幂等 */
 
 export interface Sample {
   name: string;
@@ -97,8 +97,43 @@ const duplicateDelivery = {
   },
 };
 
+const chainRelease = {
+  terminals: ['A', 'B'],
+  messages: [
+    {
+      id: 'A#1',
+      kind: 'add',
+      dot: 'D-31',
+      tag: { zone: 'Z-CHAIN', lat: 38.2, lng: 109.5, radiusKm: 2 },
+      ctx: { A: 1 },
+    },
+    {
+      id: 'A#2',
+      kind: 'add',
+      dot: 'D-32',
+      tag: { zone: 'Z-CHAIN', lat: 38.3, lng: 109.6, radiusKm: 2 },
+      ctx: { A: 2 },
+    },
+    { id: 'A#3', kind: 'remove', zone: 'Z-CHAIN', ctx: { A: 3 } },
+    {
+      id: 'B#1',
+      kind: 'add',
+      dot: 'D-33',
+      tag: { zone: 'Z-KEEP', lat: 29.6, lng: 106.5, radiusKm: 3 },
+      ctx: { B: 1 },
+    },
+  ],
+  inbox: {
+    A: ['A#1', 'A#2', 'A#3', 'B#1'],
+    // B 先收到较晚撤销 A#3 与前序新增 A#2（均缺 A#1 而暂存），
+    // 最早前序 A#1 到达后：紧邻释放中间新增 A#2，再释放更晚撤销 A#3
+    B: ['A#3', 'A#2', 'A#1', 'B#1'],
+  },
+};
+
 export const SAMPLES: Sample[] = [
   { name: '并发新增与撤销（add-wins 收敛）', data: concurrentAddRemove },
   { name: '乱序投递与暂存释放', data: outOfOrderRelease },
   { name: '重复投递幂等（四终端）', data: duplicateDelivery },
+  { name: '两级暂存释放链（撤销随新增连续释放）', data: chainRelease },
 ];

@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { runReplay } from '../src/crdt/replay';
-import type { TerminalView } from '../src/crdt/types';
+import type {
+  AddMessage,
+  Message,
+  Step,
+  TerminalView,
+  Vector,
+} from '../src/crdt/types';
 import { SAMPLES } from '../src/samples';
 
 function mulberry32(seed: number) {
@@ -130,5 +136,333 @@ describe('回放：收敛、暂存释放、重复幂等', () => {
     if (r.ok) return;
     expect(r.errors.some((e) => e.message.includes('点标识复用'))).toBe(true);
     expect('steps' in r).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 独立复核模型：完全不引用 src/crdt/engine，只按规格从原始场景重放，
+// 逐动作计算点集、版本向量、暂存队列与有效标签，用于独立复算每个步骤。
+// ---------------------------------------------------------------------------
+
+interface RawScenario {
+  terminals: string[];
+  messages: Array<Record<string, unknown>>;
+  inbox: Record<string, string[]>;
+}
+
+interface RefStep {
+  terminal: string;
+  messageId: string;
+  action: Step['action'];
+}
+
+/** 一份独立实现的参考副本：规则与 README 所述逐条对应 */
+class RefReplica {
+  vector: Vector;
+  pending: Message[] = [];
+  /** 存活点集：zone -> 事件id -> add 消息 */
+  live = new Map<string, Map<string, AddMessage>>();
+
+  constructor(private terminals: string[]) {
+    this.vector = Object.fromEntries(terminals.map((t) => [t, 0]));
+  }
+
+  private missing(m: Message): boolean {
+    if ((this.vector[m.from] ?? 0) !== m.seq - 1) return true;
+    return this.terminals.some(
+      (u) => u !== m.from && (this.vector[u] ?? 0) < (m.ctx[u] ?? 0),
+    );
+  }
+
+  private apply(m: Message): void {
+    if (m.kind === 'add') {
+      let z = this.live.get(m.tag.zone);
+      if (!z) {
+        z = new Map();
+        this.live.set(m.tag.zone, z);
+      }
+      z.set(m.id, m);
+      return;
+    }
+    const z = this.live.get(m.zone);
+    if (z) {
+      for (const eid of [...z.keys()]) {
+        const src = eid.split('#')[0];
+        const n = Number(eid.split('#')[1]);
+        if ((m.ctx[src] ?? 0) >= n) z.delete(eid);
+      }
+      if (z.size === 0) this.live.delete(m.zone);
+    }
+  }
+
+  /** 外部收件：返回该收件这一个动作（不在内部展开释放） */
+  deliver(m: Message): RefStep['action'] {
+    if ((this.vector[m.from] ?? 0) >= m.seq) return 'duplicate';
+    if (this.pending.some((p) => p.id === m.id)) return 'duplicate';
+    if (this.missing(m)) {
+      this.pending.push(m);
+      return 'buffered';
+    }
+    this.apply(m);
+    this.vector[m.from] = m.seq;
+    return 'applied';
+  }
+
+  /** 释放恰好一条就绪的暂存消息；无就绪消息返回 null */
+  releaseOnce(): Message | null {
+    for (let i = 0; i < this.pending.length; i += 1) {
+      const p = this.pending[i];
+      if (!this.missing(p)) {
+        this.pending.splice(i, 1);
+        this.apply(p);
+        this.vector[p.from] = p.seq;
+        return p;
+      }
+    }
+    return null;
+  }
+
+  zoneDots(): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    for (const [zone, adds] of this.live) {
+      out[zone] = [...adds.values()]
+        .map((a) => a.dot)
+        .sort((a, b) => a.localeCompare(b));
+    }
+    return out;
+  }
+}
+
+function indexMessages(raw: RawScenario): Record<string, Message> {
+  const byId: Record<string, Message> = {};
+  for (const rm of raw.messages) {
+    const id = rm.id as string;
+    const [from, seqStr] = id.split('#');
+    const seq = Number(seqStr);
+    const ctx: Vector = Object.fromEntries(raw.terminals.map((t) => [t, 0]));
+    for (const [k, v] of Object.entries(rm.ctx as Record<string, number>)) ctx[k] = v;
+    if (rm.kind === 'add') {
+      byId[id] = {
+        kind: 'add',
+        id,
+        from,
+        seq,
+        dot: rm.dot as string,
+        tag: rm.tag as AddMessage['tag'],
+        ctx,
+      };
+    } else {
+      byId[id] = { kind: 'remove', id, from, seq, zone: rm.zone as string, ctx };
+    }
+  }
+  return byId;
+}
+
+/**
+ * 按规格独立生成“应当的动作序列”（终端 × 收件，紧随各自的释放链），
+ * 并返回每个动作之后每个终端的向量、暂存队列、有效标签，供逐步比对。
+ */
+function referenceReplay(raw: RawScenario) {
+  const byId = indexMessages(raw);
+  const reps = Object.fromEntries(
+    raw.terminals.map((t) => [t, new RefReplica(raw.terminals)]),
+  );
+  const expected: Array<{
+    action: RefStep;
+    snapshot: Record<
+      string,
+      { vector: Vector; pending: string[]; zones: Record<string, string[]> }
+    >;
+  }> = [];
+  const done = Object.fromEntries(raw.terminals.map((t) => [t, 0]));
+
+  const snap = () =>
+    Object.fromEntries(
+      raw.terminals.map((t) => [
+        t,
+        {
+          vector: { ...reps[t].vector },
+          pending: reps[t].pending.map((p) => p.id),
+          zones: reps[t].zoneDots(),
+        },
+      ]),
+    );
+
+  const maxLen = Math.max(...raw.terminals.map((t) => raw.inbox[t].length));
+  for (let round = 0; round < maxLen; round += 1) {
+    for (const t of raw.terminals) {
+      const list = raw.inbox[t];
+      if (round >= list.length) continue;
+      done[t] += 1;
+      const msg = byId[list[round]];
+      const action = reps[t].deliver(msg);
+      expected.push({ action: { terminal: t, messageId: msg.id, action }, snapshot: snap() });
+      if (action === 'applied') {
+        let rel = reps[t].releaseOnce();
+        while (rel) {
+          expected.push({
+            action: { terminal: t, messageId: rel.id, action: 'released' },
+            snapshot: snap(),
+          });
+          rel = reps[t].releaseOnce();
+        }
+      }
+    }
+  }
+  return expected;
+}
+
+function actualZones(view: TerminalView): Record<string, string[]> {
+  return Object.fromEntries(
+    view.zones.map((z) => [z.zone, z.dots.map((d) => d.dot).sort((a, b) => a.localeCompare(b))]),
+  );
+}
+
+describe('逐步回放：释放紧邻触发收件，且每步状态可独立复算', () => {
+  // 对每个样例：用独立参考模型重放，逐步核对动作序列与全终端快照
+  for (const [sampleIndex, sample] of SAMPLES.entries()) {
+    it(`样例${sampleIndex + 1}「${sample.name}」：动作序列、版本向量、暂存队列、标签逐点复算一致`, () => {
+      const raw = sample.data as RawScenario;
+      const r = runReplay(raw);
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const expected = referenceReplay(raw);
+
+      expect(r.steps.map((s) => [s.terminal, s.messageId, s.action])).toEqual(
+        expected.map((e) => [e.action.terminal, e.action.messageId, e.action.action]),
+      );
+      expect(r.steps).toHaveLength(expected.length);
+
+      r.steps.forEach((s, i) => {
+        for (const t of raw.terminals) {
+          const got = s.stateAfter[t];
+          const want = expected[i].snapshot[t];
+          expect(got.vector, `第${i + 1}步 ${t} 版本向量`).toEqual(want.vector);
+          expect(got.pending, `第${i + 1}步 ${t} 暂存队列`).toEqual(want.pending);
+          expect(actualZones(got), `第${i + 1}步 ${t} 有效标签`).toEqual(want.zones);
+        }
+        // 收件计数只随外部收件动作推进，释放步骤不消耗收件
+        const external = r.steps
+          .slice(0, i + 1)
+          .filter((x) => x.action !== 'released' && x.terminal === s.terminal).length;
+        expect(s.stateAfter[s.terminal].inboxDone).toBe(external);
+      });
+
+      // 最终收敛
+      const last = r.steps[r.steps.length - 1].stateAfter;
+      assertConvergedIndependently(raw.terminals, last);
+    });
+  }
+
+  it('两级释放链：中间新增先释放、更晚撤销紧随其后，且两步都不被其它收件插队', () => {
+    const raw = SAMPLES[3].data as RawScenario;
+    const r = runReplay(raw);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    // 定位 B 终端：A#3、A#2 先暂存，A#1 收件触发连续释放
+    const bActions = r.steps.filter((s) => s.terminal === 'B');
+    expect(bActions.map((s) => [s.messageId, s.action])).toEqual([
+      ['A#3', 'buffered'],
+      ['A#2', 'buffered'],
+      ['A#1', 'applied'],
+      ['A#2', 'released'], // 中间新增先出现
+      ['A#3', 'released'], // 更晚撤销随后出现
+      ['B#1', 'applied'],
+    ]);
+
+    const iTrigger = r.steps.findIndex(
+      (s) => s.terminal === 'B' && s.messageId === 'A#1' && s.action === 'applied',
+    );
+    const relAdd = r.steps[iTrigger + 1];
+    const relRemove = r.steps[iTrigger + 2];
+    expect(relAdd.messageId).toBe('A#2');
+    expect(relAdd.action).toBe('released');
+    expect(relRemove.messageId).toBe('A#3');
+    expect(relRemove.action).toBe('released');
+
+    // 因果依据：两步释放都注明紧邻触发收件；撤销步还能看到发送方前序已应用
+    expect(relAdd.reason).toContain('外部收件 A#1');
+    expect(relAdd.reason).toContain('发送方前序 A#1 已应用');
+    expect(relRemove.reason).toContain('上一步释放 A#2');
+    expect(relRemove.reason).toContain('发送方前序 A#2 已应用');
+
+    const b = (s: Step) => s.stateAfter.B;
+    // 触发收件 A#1 之后：只应用了 A#1，A#2/A#3 仍暂存，标签只有 D-31
+    expect(b(r.steps[iTrigger]).vector).toEqual({ A: 1, B: 0 });
+    expect(b(r.steps[iTrigger]).pending).toEqual(['A#3', 'A#2']);
+    expect(actualZones(b(r.steps[iTrigger]))).toEqual({ 'Z-CHAIN': ['D-31'] });
+
+    // 第一级释放（中间新增 A#2）：向量推进到 A=2，撤销仍在暂存，两个点并存
+    expect(b(relAdd).vector).toEqual({ A: 2, B: 0 });
+    expect(b(relAdd).pending).toEqual(['A#3']);
+    expect(b(relAdd).inboxDone).toBe(3);
+    expect(actualZones(b(relAdd))).toEqual({ 'Z-CHAIN': ['D-31', 'D-32'] });
+
+    // 第二级释放（更晚撤销 A#3）：清空暂存，撤销清掉产生时已观测的两个点
+    expect(b(relRemove).vector).toEqual({ A: 3, B: 0 });
+    expect(b(relRemove).pending).toEqual([]);
+    expect(actualZones(b(relRemove))).toEqual({});
+    expect(relRemove.effect).toContain('D-31');
+    expect(relRemove.effect).toContain('D-32');
+
+    // 释放链期间其它终端的收件动作不得插入（三步下标连续）
+    expect(r.steps.slice(iTrigger, iTrigger + 3).map((s) => s.terminal)).toEqual(['B', 'B', 'B']);
+  });
+
+  it('任意乱序收件（含重复）下，回放动作序列与独立模型逐点一致且最终收敛', () => {
+    for (let iter = 0; iter < 30; iter += 1) {
+      const rnd = mulberry32(iter + 100);
+      const clone = structuredClone(SAMPLES[3].data) as RawScenario;
+      for (const t of clone.terminals) clone.inbox[t] = shuffle([...clone.inbox[t]], rnd);
+      // 混入重复投递
+      clone.inbox.A.push(clone.inbox.A[0]);
+      clone.inbox.B.push(clone.inbox.B[1], clone.inbox.B[0]);
+
+      const r = runReplay(clone);
+      expect(r.ok, `第 ${iter} 轮场景应合法`).toBe(true);
+      if (!r.ok) continue;
+      const expected = referenceReplay(clone);
+      expect(
+        r.steps.map((s) => [s.terminal, s.messageId, s.action]),
+        `第 ${iter} 轮动作序列`,
+      ).toEqual(expected.map((e) => [e.action.terminal, e.action.messageId, e.action.action]));
+      r.steps.forEach((s, i) => {
+        for (const t of clone.terminals) {
+          expect(s.stateAfter[t].vector, `第${iter}轮 第${i + 1}步 ${t} 向量`).toEqual(
+            expected[i].snapshot[t].vector,
+          );
+          expect(s.stateAfter[t].pending, `第${iter}轮 第${i + 1}步 ${t} 暂存`).toEqual(
+            expected[i].snapshot[t].pending,
+          );
+          expect(actualZones(s.stateAfter[t]), `第${iter}轮 第${i + 1}步 ${t} 标签`).toEqual(
+            expected[i].snapshot[t].zones,
+          );
+        }
+      });
+      assertConvergedIndependently(clone.terminals, r.steps[r.steps.length - 1].stateAfter);
+    }
+  });
+
+  it('add-wins：并发新增（晚于撤销产生）在撤销释放后仍存活', () => {
+    const raw = SAMPLES[0].data as RawScenario;
+    const r = runReplay(raw);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // B 终端：A#2（撤销，ctx 仅 A:2）先暂存；A#1 释放撤销时 B#1 尚未到达，
+    // 随后 B#1 的并发点 D-02 必须存活
+    const last = r.steps[r.steps.length - 1].stateAfter;
+    for (const t of raw.terminals) {
+      const alpha = last[t].zones.find((z) => z.zone === 'Z-ALPHA');
+      expect(alpha?.dots.map((d) => d.dot)).toEqual(['D-02']);
+    }
+    // 撤销释放步紧邻其触发收件
+    const removeRelease = r.steps.find(
+      (s) => s.terminal === 'B' && s.messageId === 'A#2' && s.action === 'released',
+    );
+    expect(removeRelease).toBeDefined();
+    const prev = r.steps[removeRelease!.index - 1];
+    expect(prev.terminal).toBe('B');
+    expect(prev.action === 'applied' || prev.action === 'released').toBe(true);
   });
 });

@@ -1,10 +1,16 @@
-import { Replica, type ReleasedApply } from './engine';
+import { Replica } from './engine';
 import { parseScenario } from './parse';
 import type { MessageSummary, ReplayResult, Step, TerminalView } from './types';
 
 /**
- * 回放：按“轮次 × 终端”顺序消费各终端收件顺序，
- * 逐步记录动作、因果依据与全终端快照，最后复核收敛性。
+ * 回放：按“轮次 × 终端”顺序消费各终端收件顺序，逐步记录动作、
+ * 因果依据与全终端快照，最后复核收敛性。
+ *
+ * 一次外部收件可能补齐多条连续的因果依赖：触发收件先作为一步记录，
+ * 随后在同一终端连续记录每一条被释放的暂存消息（中间新增先出现、
+ * 更晚撤销随后出现……），每条释放都有独立快照——该步的版本向量、
+ * 待处理队列与有效标签只反映截至该动作的状态，且全部释放步骤
+ * 紧邻其触发收件，不被任何后续收件插队。
  *
  * 纯函数、无 IO：既可在 Web Worker 中运行，也可在 Node 下被测试直接调用。
  */
@@ -16,10 +22,6 @@ export function runReplay(raw: unknown): ReplayResult {
   const replicas = new Map(sc.terminals.map((t) => [t, new Replica(t, sc.terminals)]));
   const done = new Map(sc.terminals.map((t) => [t, 0]));
   const steps: Step[] = [];
-  const deferredReleases = new Map<
-    number,
-    Array<{ terminal: string; release: ReleasedApply }>
-  >();
   const maxLen = Math.max(...sc.terminals.map((t) => sc.inbox[t].length));
   let index = 0;
 
@@ -31,16 +33,25 @@ export function runReplay(raw: unknown): ReplayResult {
     return out;
   };
 
-  const appendRelease = (terminal: string, rel: ReleasedApply, round: number) => {
+  /** 追加一步并拍摄该步之后的全终端快照（状态仅截至本动作） */
+  const appendStep = (
+    terminal: string,
+    round: number,
+    messageId: string,
+    kind: 'add' | 'remove',
+    action: Step['action'],
+    reason: string,
+    effect: string,
+  ): void => {
     steps.push({
       index: index++,
       round,
       terminal,
-      messageId: rel.msg.id,
-      kind: rel.msg.kind,
-      action: 'released',
-      reason: rel.reason,
-      effect: rel.effect,
+      messageId,
+      kind,
+      action,
+      reason,
+      effect,
       stateAfter: capture(),
     });
   };
@@ -49,35 +60,27 @@ export function runReplay(raw: unknown): ReplayResult {
     for (const t of sc.terminals) {
       const inbox = sc.inbox[t];
       if (round >= inbox.length) continue;
+      const replica = replicas.get(t)!;
       const mid = inbox[round];
       const msg = sc.messagesById[mid];
       done.set(t, done.get(t)! + 1);
-      const res = replicas.get(t)!.deliver(msg);
-      steps.push({
-        index: index++,
-        round,
-        terminal: t,
-        messageId: mid,
-        kind: msg.kind,
-        action: res.action,
-        reason: res.reason,
-        effect: res.effect,
-        stateAfter: capture(),
-      });
-      for (const rel of res.releases) {
-        const scheduled = deferredReleases.get(round + 1) ?? [];
-        scheduled.push({ terminal: t, release: rel });
-        deferredReleases.set(round + 1, scheduled);
+
+      // 第一步：外部收件本身（应用 / 暂存 / 重复）。快照只反映本动作，
+      // 不含任何由它触发的暂存释放。
+      const res = replica.deliver(msg);
+      appendStep(t, round, mid, msg.kind, res.action, res.reason, res.effect);
+
+      // 紧随其后的连续步骤：逐条释放因本次收件而就绪的暂存消息，
+      // 每条释放单独拍摄快照；多级依赖链按就绪顺序级联展开。
+      // 重复或纯暂存收件不补齐任何依赖，循环立即结束。
+      if (res.action === 'applied') {
+        let rel = replica.releaseOnce(`外部收件 ${mid} 应用后依赖补齐`);
+        while (rel) {
+          const releasedId = rel.msg.id;
+          appendStep(t, round, releasedId, rel.msg.kind, 'released', rel.reason, rel.effect);
+          rel = replica.releaseOnce(`上一步释放 ${releasedId} 应用后依赖补齐`);
+        }
       }
-    }
-    for (const entry of deferredReleases.get(round) ?? []) {
-      appendRelease(entry.terminal, entry.release, round);
-    }
-    deferredReleases.delete(round);
-  }
-  for (const [round, entries] of deferredReleases) {
-    for (const entry of entries) {
-      appendRelease(entry.terminal, entry.release, round);
     }
   }
 

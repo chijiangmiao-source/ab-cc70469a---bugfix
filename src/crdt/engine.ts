@@ -10,8 +10,6 @@ export interface DeliverResult {
   action: 'applied' | 'duplicate' | 'buffered';
   reason: string;
   effect: string;
-  /** 本次应用触发暂存队列释放的消息（按释放顺序） */
-  releases: ReleasedApply[];
 }
 
 export function parseEventId(id: string): { t: string; n: number } {
@@ -30,7 +28,9 @@ export function parseEventId(id: string): { t: string; n: number } {
  * 因果投递规则：
  * - 来自 F 的第 n 条消息可应用当且仅当 vector[F] === n-1，
  *   且对所有其他终端 U 有 vector[U] >= ctx[U]；
- * - 不满足则进入暂存队列，待依赖补齐后按就绪顺序释放；
+ * - 不满足则进入暂存队列；一次收件可能补齐多条依赖，级联释放由调用方
+ *   通过反复调用 releaseOnce() 逐条驱动，每条释放都是独立的一步，
+ *   其状态必须只反映截至该释放动作的点集 / 版本向量 / 暂存队列；
  * - vector[F] >= n 或已在暂存队列中的再次投递判为重复，状态不变。
  */
 export class Replica {
@@ -68,14 +68,15 @@ export class Replica {
     return out;
   }
 
-  private readyReason(m: Message): string {
+  /** 消息已就绪的因果依据（用于“应用 / 释放”步骤说明） */
+  readyReason(m: Message): string {
     const head =
       m.seq === 1 ? `发送方首条事件` : `发送方前序 ${m.from}#${m.seq - 1} 已应用`;
     const deps: string[] = [];
     for (const u of this.terminals) {
       if (u === m.from) continue;
       const need = m.ctx[u] ?? 0;
-      if (need > 0) deps.push(`${u}≥${need}（本机 ${this.vector[u] ?? 0}）`);
+      if (need > 0) deps.push(`${u}≥${need}（本机 ${u}=${this.vector[u] ?? 0}）`);
     }
     const tail = deps.length > 0 ? `依赖已满足：${deps.join('，')}` : `无其他因果依赖`;
     return `因果就绪：${head}；${tail}`;
@@ -110,6 +111,11 @@ export class Replica {
       : `撤销 ${m.zone}：上下文未覆盖现存点，并发新增保留`;
   }
 
+  /**
+   * 投递一条外部收件。仅处理该消息本身：就绪即应用并推进版本向量，
+   * 暂存队列中因此就绪的消息不会在本次调用内应用，须由调用方逐条
+   * 调用 releaseOnce() 释放，以保证每条释放拥有独立、可复算的步骤快照。
+   */
   deliver(m: Message): DeliverResult {
     // 幂等：已应用过的事件再次投递不改变状态
     if ((this.vector[m.from] ?? 0) >= m.seq) {
@@ -117,7 +123,6 @@ export class Replica {
         action: 'duplicate',
         reason: `重复投递：${m.id} 已应用（本机 ${m.from}=${this.vector[m.from]} ≥ ${m.seq}），状态不变`,
         effect: '',
-        releases: [],
       };
     }
     if (this.pendingList.some((p) => p.id === m.id)) {
@@ -125,45 +130,48 @@ export class Replica {
         action: 'duplicate',
         reason: `重复投递：${m.id} 已在暂存队列中，状态不变`,
         effect: '',
-        releases: [],
       };
     }
-    // 因果前序检查：缺失则暂存
+    // 因果前序检查：缺失则暂存（不改变点集与版本向量）
     const miss = this.missing(m);
     if (miss.length > 0) {
       this.pendingList.push(m);
-      return { action: 'buffered', reason: `暂存：${miss.join('；')}`, effect: '', releases: [] };
+      return { action: 'buffered', reason: `暂存：${miss.join('；')}`, effect: '' };
     }
-    // 应用并推进版本向量
     const effect = this.apply(m);
     this.vector[m.from] = m.seq;
-    // 依赖补齐后释放暂存消息（可能级联）
-    const releases: ReleasedApply[] = [];
-    let progressed = true;
-    while (progressed) {
-      progressed = false;
-      for (let i = 0; i < this.pendingList.length; i += 1) {
-        const p = this.pendingList[i];
-        if ((this.vector[p.from] ?? 0) >= p.seq) {
-          this.pendingList.splice(i, 1);
-          i -= 1;
-          continue;
-        }
-        if (this.missing(p).length === 0) {
-          this.pendingList.splice(i, 1);
-          i -= 1;
-          const eff = this.apply(p);
-          this.vector[p.from] = p.seq;
-          releases.push({
-            msg: p,
-            reason: `暂存解除（由 ${m.id} 的应用触发）：因果依赖已补齐`,
-            effect: eff,
-          });
-          progressed = true;
-        }
+    return { action: 'applied', reason: this.readyReason(m), effect };
+  }
+
+  /**
+   * 尝试释放一条暂存消息：按暂存到达顺序扫描，应用第一条已就绪的消息
+   * 并推进版本向量，返回该释放动作；本轮无就绪消息时返回 null。
+   * 一次外部收件补齐多级依赖时，调用方应循环调用本方法直至 null，
+   * 每次调用对应回放中紧邻触发收件的一个连续步骤。
+   *
+   * @param triggerLabel 本步释放的直接触发来源说明（外部收件或上一步释放）
+   */
+  releaseOnce(triggerLabel: string): ReleasedApply | null {
+    for (let i = 0; i < this.pendingList.length; i += 1) {
+      const p = this.pendingList[i];
+      if ((this.vector[p.from] ?? 0) >= p.seq) {
+        // 已被其它路径应用（防御性）：直接移出队列，不构成释放步骤
+        this.pendingList.splice(i, 1);
+        i -= 1;
+        continue;
+      }
+      if (this.missing(p).length === 0) {
+        this.pendingList.splice(i, 1);
+        const eff = this.apply(p);
+        this.vector[p.from] = p.seq;
+        return {
+          msg: p,
+          reason: `暂存释放（${triggerLabel}）：${this.readyReason(p)}`,
+          effect: eff,
+        };
       }
     }
-    return { action: 'applied', reason: this.readyReason(m), effect, releases };
+    return null;
   }
 
   /** 当前可视状态快照 */

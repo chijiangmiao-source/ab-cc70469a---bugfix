@@ -33,7 +33,7 @@ describe('副本引擎', () => {
     expect(view.zones[0].dots[0].dot).toBe('D1');
   });
 
-  it('缺少发送方前序时暂存，补齐后级联释放', () => {
+  it('缺少发送方前序时暂存，补齐后由 releaseOnce 逐条释放', () => {
     const r = new Replica('X', TERMINALS);
     const b2 = add('B#2', 'D2', 'Z2', { B: 2 });
     const b1 = add('B#1', 'D1', 'Z1', { B: 1 });
@@ -45,9 +45,47 @@ describe('副本引擎', () => {
 
     const second = r.deliver(b1);
     expect(second.action).toBe('applied');
-    expect(second.releases.map((x) => x.msg.id)).toEqual(['B#2']);
+    // deliver 不再在调用内部吞掉级联：释放必须由调用方逐条驱动
+    expect(second.effect).toContain('Z1');
+    const rel = r.releaseOnce('外部收件 B#1');
+    expect(rel?.msg.id).toBe('B#2');
+    expect(rel?.reason).toContain('B#1');
+    expect(r.releaseOnce('外部收件 B#1')).toBeNull();
     expect(r.pendingList).toHaveLength(0);
     expect(r.vector.B).toBe(2);
+  });
+
+  it('一次收件补齐两级依赖时，两次释放各自只反映截至该步的状态', () => {
+    const r = new Replica('X', TERMINALS);
+    const b3 = remove('B#3', 'Z1', { B: 3 });
+    const b2 = add('B#2', 'D2', 'Z1', { B: 2 });
+    const b1 = add('B#1', 'D1', 'Z1', { B: 1 });
+
+    expect(r.deliver(b3).action).toBe('buffered');
+    expect(r.deliver(b2).action).toBe('buffered');
+
+    // 触发收件只应用自身：向量停在 B=1，两条消息仍在暂存
+    const trigger = r.deliver(b1);
+    expect(trigger.action).toBe('applied');
+    expect(r.vector.B).toBe(1);
+    expect(r.pendingList.map((m) => m.id)).toEqual(['B#3', 'B#2']);
+    expect(r.view(3, 3).zones[0].dots.map((d) => d.dot)).toEqual(['D1']);
+
+    // 第一级：中间新增 B#2 释放
+    const rel2 = r.releaseOnce('外部收件 B#1');
+    expect(rel2?.msg.id).toBe('B#2');
+    expect(r.vector.B).toBe(2);
+    expect(r.pendingList.map((m) => m.id)).toEqual(['B#3']);
+    expect(r.view(3, 3).zones[0].dots.map((d) => d.dot)).toEqual(['D1', 'D2']);
+
+    // 第二级：更晚撤销 B#3 释放，清除已观测点
+    const rel3 = r.releaseOnce('上一步释放 B#2');
+    expect(rel3?.msg.id).toBe('B#3');
+    expect(rel3?.effect).toContain('D1');
+    expect(r.vector.B).toBe(3);
+    expect(r.pendingList).toHaveLength(0);
+    expect(r.view(3, 3).zones).toHaveLength(0);
+    expect(r.releaseOnce('上一步释放 B#3')).toBeNull();
   });
 
   it('缺少跨终端因果依赖时暂存，依赖到达后释放', () => {
@@ -58,7 +96,9 @@ describe('副本引擎', () => {
     expect(r.deliver(b1).action).toBe('buffered');
     const res = r.deliver(c1);
     expect(res.action).toBe('applied');
-    expect(res.releases.map((x) => x.msg.id)).toEqual(['B#1']);
+    const rel = r.releaseOnce('外部收件 C#1');
+    expect(rel?.msg.id).toBe('B#1');
+    expect(r.releaseOnce('外部收件 C#1')).toBeNull();
     expect(r.view(2, 2).zones.map((z) => z.zone)).toEqual(['ZB', 'ZC']);
   });
 
