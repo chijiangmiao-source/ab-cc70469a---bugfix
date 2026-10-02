@@ -14,6 +14,17 @@ export interface DeliverResult {
   releases: ReleasedApply[];
 }
 
+/**
+ * 逐步观察投递内部的状态静止点：
+ * - afterTriggerApply：触发消息自身已应用、向量已推进，但暂存释放尚未开始；
+ * - afterRelease：每一条暂存消息释放后立即触发（此时点集/向量只推进了这一条）。
+ * 回放器据此为“触发收件”和每一条因果释放记录互不重叠的单步快照。
+ */
+export interface DeliverHooks {
+  afterTriggerApply?: () => void;
+  afterRelease?: (rel: ReleasedApply) => void;
+}
+
 export function parseEventId(id: string): { t: string; n: number } {
   const i = id.lastIndexOf('#');
   return { t: id.slice(0, i), n: Number(id.slice(i + 1)) };
@@ -68,17 +79,22 @@ export class Replica {
     return out;
   }
 
-  private readyReason(m: Message): string {
+  /** 消息此刻可应用的因果依据（前序链 + 上下文依赖的当前向量值） */
+  causalBasis(m: Message): string {
     const head =
       m.seq === 1 ? `发送方首条事件` : `发送方前序 ${m.from}#${m.seq - 1} 已应用`;
     const deps: string[] = [];
     for (const u of this.terminals) {
       if (u === m.from) continue;
       const need = m.ctx[u] ?? 0;
-      if (need > 0) deps.push(`${u}≥${need}（本机 ${this.vector[u] ?? 0}）`);
+      if (need > 0) deps.push(`${u}≥${need}（本机 ${u}=${this.vector[u] ?? 0}）`);
     }
     const tail = deps.length > 0 ? `依赖已满足：${deps.join('，')}` : `无其他因果依赖`;
-    return `因果就绪：${head}；${tail}`;
+    return `${head}；${tail}`;
+  }
+
+  private readyReason(m: Message): string {
+    return `因果就绪：${this.causalBasis(m)}`;
   }
 
   /** 应用消息到点集，返回状态影响描述 */
@@ -110,7 +126,7 @@ export class Replica {
       : `撤销 ${m.zone}：上下文未覆盖现存点，并发新增保留`;
   }
 
-  deliver(m: Message): DeliverResult {
+  deliver(m: Message, hooks: DeliverHooks = {}): DeliverResult {
     // 幂等：已应用过的事件再次投递不改变状态
     if ((this.vector[m.from] ?? 0) >= m.seq) {
       return {
@@ -137,7 +153,9 @@ export class Replica {
     // 应用并推进版本向量
     const effect = this.apply(m);
     this.vector[m.from] = m.seq;
-    // 依赖补齐后释放暂存消息（可能级联）
+    // 触发收件自身已成静止点：其快照必须只反映这一条消息，不含任何暂存释放
+    hooks.afterTriggerApply?.();
+    // 依赖补齐后释放暂存消息（可能级联）；每释放一条即产生一个独立静止点
     const releases: ReleasedApply[] = [];
     let progressed = true;
     while (progressed) {
@@ -154,11 +172,13 @@ export class Replica {
           i -= 1;
           const eff = this.apply(p);
           this.vector[p.from] = p.seq;
-          releases.push({
+          const rel: ReleasedApply = {
             msg: p,
-            reason: `暂存解除（由 ${m.id} 的应用触发）：因果依赖已补齐`,
+            reason: `暂存释放（紧邻触发收件 ${m.id}）：${this.causalBasis(p)}`,
             effect: eff,
-          });
+          };
+          releases.push(rel);
+          hooks.afterRelease?.(rel);
           progressed = true;
         }
       }

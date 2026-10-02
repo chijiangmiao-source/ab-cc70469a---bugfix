@@ -12,6 +12,7 @@
 - **新增 add**：携带全局唯一点标识 `dot` 与标签载荷 `tag`（元素身份为 `zone`），把 `(zone, 事件id)` 加入点集。
 - **撤销 remove**：携带产生时已见上下文 `ctx`，仅清除点集中被 `ctx` 覆盖（产生时已观察到）的同区域点；**未见过的并发新增保留**（add-wins）。
 - **因果投递**：来自 `F` 的第 `n` 条消息可应用 ⟺ 本机 `vector[F] = n-1` 且对所有 `U ≠ F` 有 `vector[U] ≥ ctx[U]`；不满足则进入暂存队列，依赖补齐后级联释放。
+- **释放即连续步骤**：一次收件补齐多条依赖时，触发收件只记录其自身效果；每条暂存释放作为**紧邻该收件的独立步骤**按就绪顺序记录（中间新增先出现、更晚撤销随后出现），每一步的点集、版本向量与暂存队列只推进到该动作，中间不插入任何后续收件。
 - **幂等**：已应用或已在暂存队列中的消息再次投递判为重复，状态不变。
 
 ## 场景格式
@@ -61,7 +62,7 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify
 echo $?   # 0 = 全部通过
 ```
 
-`verify` 服务依次执行：`vitest run`（并发新增与撤销收敛、乱序暂存释放、重复投递幂等、非法输入拒绝）→ `tsc + vite build` → 对 `web` 服务的 `/health` 与 `/` 做 HTTP 冒烟，全部通过退出 0，否则非零。
+`verify` 服务依次执行：`vitest run`（并发新增与撤销收敛、乱序暂存释放、≥2 级暂存释放链与释放步骤相对顺序、逐步状态独立复算、重复投递幂等、非法输入拒绝）→ `tsc + vite build` → 对 `web` 服务的 `/health` 与 `/` 做 HTTP 冒烟，全部通过退出 0，否则非零。
 
 ## 目录结构
 
@@ -69,7 +70,7 @@ echo $?   # 0 = 全部通过
 src/crdt/      纯 TS 核心：types / parse(校验) / engine(副本) / replay(回放)
 src/worker/    回放计算 Web Worker
 src/ui/        React 组件（编辑器、控制条、终端面板、步骤日志）
-src/samples.ts 内置样例（并发收敛 / 乱序释放 / 重复幂等）
+src/samples.ts 内置样例（并发收敛 / 乱序释放 / 重复幂等 / 两级释放链）
 tests/         vitest 测试
 Dockerfile     多阶段：deps / build / verify / web(nginx)
 docker-compose.yml  web（健康检查 + 可配端口）与 verify（一次性验收）

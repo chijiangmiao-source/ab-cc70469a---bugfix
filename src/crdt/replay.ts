@@ -6,6 +6,10 @@ import type { MessageSummary, ReplayResult, Step, TerminalView } from './types';
  * 回放：按“轮次 × 终端”顺序消费各终端收件顺序，
  * 逐步记录动作、因果依据与全终端快照，最后复核收敛性。
  *
+ * 一次收件若补齐了多条因果依赖，其暂存释放必须作为**紧邻该收件的连续步骤**
+ * 逐条记录：触发收件的快照只反映触发消息自身；随后每释放一条暂存消息，
+ * 就立即记录一个只推进该条消息的独立快照。绝不先处理后续收件、再补记释放。
+ *
  * 纯函数、无 IO：既可在 Web Worker 中运行，也可在 Node 下被测试直接调用。
  */
 export function runReplay(raw: unknown): ReplayResult {
@@ -16,10 +20,6 @@ export function runReplay(raw: unknown): ReplayResult {
   const replicas = new Map(sc.terminals.map((t) => [t, new Replica(t, sc.terminals)]));
   const done = new Map(sc.terminals.map((t) => [t, 0]));
   const steps: Step[] = [];
-  const deferredReleases = new Map<
-    number,
-    Array<{ terminal: string; release: ReleasedApply }>
-  >();
   const maxLen = Math.max(...sc.terminals.map((t) => sc.inbox[t].length));
   let index = 0;
 
@@ -31,20 +31,6 @@ export function runReplay(raw: unknown): ReplayResult {
     return out;
   };
 
-  const appendRelease = (terminal: string, rel: ReleasedApply, round: number) => {
-    steps.push({
-      index: index++,
-      round,
-      terminal,
-      messageId: rel.msg.id,
-      kind: rel.msg.kind,
-      action: 'released',
-      reason: rel.reason,
-      effect: rel.effect,
-      stateAfter: capture(),
-    });
-  };
-
   for (let round = 0; round < maxLen; round += 1) {
     for (const t of sc.terminals) {
       const inbox = sc.inbox[t];
@@ -52,7 +38,22 @@ export function runReplay(raw: unknown): ReplayResult {
       const mid = inbox[round];
       const msg = sc.messagesById[mid];
       done.set(t, done.get(t)! + 1);
-      const res = replicas.get(t)!.deliver(msg);
+
+      // 钩子在引擎内部的状态静止点触发：
+      // - triggerSnap：触发消息已应用、释放尚未开始（只含触发消息的效果）；
+      // - 每条级联释放完成后立即抓快照（点集/向量/暂存只推进到该条）。
+      let triggerSnap: Record<string, TerminalView> | null = null;
+      const releasedEntries: Array<{ rel: ReleasedApply; snap: Record<string, TerminalView> }> = [];
+      const res = replicas.get(t)!.deliver(msg, {
+        afterTriggerApply: () => {
+          triggerSnap = capture();
+        },
+        afterRelease: (rel) => {
+          releasedEntries.push({ rel, snap: capture() });
+        },
+      });
+
+      // 触发收件本身（applied / buffered / duplicate）：快照不含任何暂存释放
       steps.push({
         index: index++,
         round,
@@ -62,22 +63,22 @@ export function runReplay(raw: unknown): ReplayResult {
         action: res.action,
         reason: res.reason,
         effect: res.effect,
-        stateAfter: capture(),
+        stateAfter: triggerSnap ?? capture(),
       });
-      for (const rel of res.releases) {
-        const scheduled = deferredReleases.get(round + 1) ?? [];
-        scheduled.push({ terminal: t, release: rel });
-        deferredReleases.set(round + 1, scheduled);
+      // 因果释放：紧邻触发收件、按引擎内实际级联顺序逐条记录
+      for (const { rel, snap } of releasedEntries) {
+        steps.push({
+          index: index++,
+          round,
+          terminal: t,
+          messageId: rel.msg.id,
+          kind: rel.msg.kind,
+          action: 'released',
+          reason: rel.reason,
+          effect: rel.effect,
+          stateAfter: snap,
+        });
       }
-    }
-    for (const entry of deferredReleases.get(round) ?? []) {
-      appendRelease(entry.terminal, entry.release, round);
-    }
-    deferredReleases.delete(round);
-  }
-  for (const [round, entries] of deferredReleases) {
-    for (const entry of entries) {
-      appendRelease(entry.terminal, entry.release, round);
     }
   }
 
